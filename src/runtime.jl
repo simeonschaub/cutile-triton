@@ -237,7 +237,7 @@ function code_triton(io::IO, @nospecialize(f), @nospecialize(argtypes);
         print(io, ttir)
         return nothing
     end
-    k = _compile_py(ttir, name, num_warps, num_stages)
+    k = _compile_py(ttir, name, num_warps, something(num_stages, _default_stages()))
     if stage === :sass
         cubin_path = joinpath(mktempdir(), "$name.cubin")
         write(cubin_path, pyconvert(Vector{UInt8}, k.asm["cubin"]))
