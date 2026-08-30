@@ -6,6 +6,7 @@ module TritonRun
 using CUDA
 using PythonCall
 using ..TritonEmitter: emit_ttir, ArgSpec
+import cuTile as ct
 
 export triton_kernel, launch!, code_triton, set_target!
 
@@ -106,9 +107,28 @@ One kernel for memory-bound code (4 warps); for tensor-core kernels without
 atomics, both a 4- and an 8-warp build for first-launch autotuning (mirrors
 `@triton.autotune`: measure once per specialization, remember the winner).
 """
+# Triton's pre-Hopper lowering of TMA descriptor loads/stores fails for
+# 16-bit floats (`ConvertTritonGPUToLLVM` → "PassManager::run failed");
+# plain pointer accesses compile fine, so descriptors are skipped whenever
+# a 16-bit float array reaches the kernel (recursively: TileArrays arrive
+# inside structs such as SplitRangeCSRMatrix).
+function has_16bit_float_array(@nospecialize(T), seen = Base.IdSet{Any}())
+    T in seen && return false
+    push!(seen, T)
+    T isa DataType || return false
+    if T <: ct.TileArray
+        ET = eltype(T)
+        return ET <: AbstractFloat && sizeof(ET) == 2
+    end
+    return any(FT -> has_16bit_float_array(FT, seen), fieldtypes(T))
+end
+tma_eligible(@nospecialize(argtypes)) =
+    !any(has_16bit_float_array, argtypes isa Type ? argtypes.parameters : argtypes)
+
 function triton_kernel_candidates(@nospecialize(f), @nospecialize(argtypes);
                                   name::String, use_tma::Bool=true)
     use_tma &= _default_target().backend == "cuda"  # descriptors are NVIDIA-only
+    use_tma &= tma_eligible(argtypes)
     ttir, argspec, meta = emit_ttir(f, argtypes; name, use_tma)
     if !meta.has_dot
         return [compile_kernel(ttir, argspec; name, num_warps=4)]
@@ -129,6 +149,7 @@ function triton_kernel(@nospecialize(f), @nospecialize(argtypes);
                        name::String, num_warps::Union{Int,Nothing}=nothing,
                        num_stages::Union{Int,Nothing}=nothing, use_tma::Bool=true)
     use_tma &= _default_target().backend == "cuda"  # descriptors are NVIDIA-only
+    use_tma &= tma_eligible(argtypes)
     ttir, argspec, meta = emit_ttir(f, argtypes; name, use_tma)
     # schedule heuristic mirroring tileiras' observed choices: tensor-core
     # kernels get 8 warps, memory-bound kernels 4
