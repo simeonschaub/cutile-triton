@@ -139,17 +139,33 @@ end
 # triton's own backend defaults: 3 pipeline stages on NVIDIA, 2 on AMD (64KB LDS)
 _default_stages() = _default_target().backend == "cuda" ? 3 : 2
 
+# Per-block dynamic shared memory limit of the current device (opt-in), or
+# nothing when the backend has no queryable limit.
+_shared_limit() = _default_target().backend == "cuda" ?
+    CUDA.attribute(CUDA.device(),
+                   CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN) : nothing
+
 function compile_kernel(ttir::String, argspec; name::String, num_warps::Int,
                         num_stages::Union{Int,Nothing}=nothing)
+    explicit_stages = num_stages !== nothing
     num_stages = something(num_stages, _default_stages())
     if haskey(ENV, "TRITON_DUMP_TTIR")
         mkpath(ENV["TRITON_DUMP_TTIR"])
         write(joinpath(ENV["TRITON_DUMP_TTIR"], "$(name)_w$(num_warps)_$(hash(ttir) % 10000).ttir"), ttir)
     end
     k = _compile_py(ttir, name, num_warps, num_stages)
+    shared = pyconvert(Int, k.metadata.shared)
+    # triton sizes its software pipeline for the tile shape, not the device:
+    # a 3-stage matmul that fits an H100's 228KB can exceed a consumer GPU's
+    # ~99KB opt-in limit. Drop stages until the kernel fits.
+    limit = explicit_stages ? nothing : _shared_limit()
+    while limit !== nothing && shared > limit && num_stages > 1
+        num_stages -= 1
+        k = _compile_py(ttir, name, num_warps, num_stages)
+        shared = pyconvert(Int, k.metadata.shared)
+    end
     t = _default_target()
     bin = pyconvert(Vector{UInt8}, k.asm[t.binkey])
-    shared = pyconvert(Int, k.metadata.shared)
     warp_size = pyconvert(Int, k.metadata.warp_size)
     # NVIDIA-only metadata field; the AMD backend has no global scratch
     # (its launcher passes NULL in that ABI slot).
