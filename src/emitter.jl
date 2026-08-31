@@ -729,7 +729,7 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         sizes = resolve(cg, args[3])
         strides = resolve(cg, args[4])
         elty = eltype(TA)
-        spec = TA.parameters[3]
+        spec = TA.parameters[end]   # last param is the ArraySpec (cuTile 1.0 has I before it)
         contig = (spec isa DataType ? spec : typeof(spec)).parameters[3]::Bool
         return ViewInfo(asvalue(ptr), Any[sizes...], Any[strides...], elty,
                         nothing, :undetermined, contig, nothing, nothing)
@@ -1560,7 +1560,8 @@ _divattr(v) = (EMIT_DIV_ATTRS[] && v >= 2) ?
     IR.Attribute(Dict{String,IR.Attribute}())
 
 function _spec_params(@nospecialize(T))
-    spec = T.parameters[3]
+    # TileArray{T,N,I,Spec}: the spec is the last parameter
+    spec = T.parameters[end]
     P = (spec isa DataType ? spec : typeof(spec)).parameters
     # (N, Alignment, Contiguous, StrideDivBy, ShapeDivBy)
     return Int(P[2]), P[3]::Bool, P[4], P[5]
