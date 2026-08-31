@@ -102,19 +102,23 @@ end
 """
     triton_kernel_candidates(f, argtypes; name, use_tma=true) -> Vector{TritonKernel}
 
-One kernel for memory-bound code (4 warps); for tensor-core kernels without
-atomics, both a 4- and an 8-warp build for first-launch autotuning (mirrors
-`@triton.autotune`: measure once per specialization, remember the winner).
+A 4- and an 8-warp build for first-launch autotuning (mirrors
+`@triton.autotune`: measure once per specialization, remember the winner);
+tensor-core kernels without atomics additionally race load style × hints.
 """
 function triton_kernel_candidates(@nospecialize(f), @nospecialize(argtypes);
                                   name::String, use_tma::Bool=true)
     use_tma &= _default_target().backend == "cuda"  # descriptors are NVIDIA-only
     ttir, argspec, meta = emit_ttir(f, argtypes; name, use_tma)
-    if !meta.has_dot
-        return [compile_kernel(ttir, argspec; name, num_warps=4)]
-    end
+    # atomic kernels are not rerun-safe, so they cannot race: pin 8 warps
+    # (winner on every measured case, e.g. sm_120 layernorm bwd_dx 414→284µs)
     meta.has_atomic &&
         return [compile_kernel(ttir, argspec; name, num_warps=8)]
+    if !meta.has_dot
+        # memory-bound kernels: 8 warps wins on starved grids and loop-heavy
+        # reductions (sm_120 layernorm bwd_dwdb: 101→59µs), 4 warps elsewhere
+        return [compile_kernel(ttir, argspec; name, num_warps=w) for w in (4, 8)]
+    end
     # dot kernels: TMA-vs-pointer and argument hints both interact with the
     # tensor-core pipeline in shape-dependent ways — race load style × hints
     # × warps (unique TTIRs only; e.g. TMA-ineligible kernels dedupe)
@@ -253,7 +257,7 @@ function code_triton(io::IO, @nospecialize(f), @nospecialize(argtypes);
         print(io, ttir)
         return nothing
     end
-    k = _compile_py(ttir, name, num_warps, num_stages)
+    k = _compile_py(ttir, name, num_warps, something(num_stages, _default_stages()))
     if stage === :sass
         cubin_path = joinpath(mktempdir(), "$name.cubin")
         write(cubin_path, pyconvert(Vector{UInt8}, k.asm["cubin"]))
