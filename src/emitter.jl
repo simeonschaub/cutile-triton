@@ -837,6 +837,29 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         mv === nothing ? tt.store(ptrs, val) : tt.store(ptrs, val, mv)
         return nothing
 
+    # ---- printing ----
+    elseif f === :print_tko
+        # (segments-and-values..., token): string segments become tt.print
+        # prefixes; each value gets its own tt.print carrying the preceding text
+        items = Any[resolve(cg, a) for a in args[1:end-1]]   # drop the token
+        prefix = ""
+        for it in items
+            if it isa AbstractString
+                prefix *= it
+            elseif it isa IR.Value || it isa TF32Val
+                vv = asvalue(it)
+                t = IR.type(vv)
+                et = API.mlirTypeIsARankedTensor(t) ? tensor_elem(t) : t
+                signed = API.mlirTypeIsAInteger(et) ? Int32(1) : Int32(0)
+                tt.print(IR.Value[vv]; prefix=prefix, hex=false, isSigned=Int32[signed])
+                prefix = ""
+            else
+                prefix *= string(it)   # compile-time constant
+            end
+        end
+        isempty(prefix) || tt.print(IR.Value[]; prefix=prefix, hex=false, isSigned=Int32[])
+        return nothing
+
     # ---- constants / construction ----
     elseif f === :constant
         shape = resolve(cg, args[1])   # (shape, value, T)
