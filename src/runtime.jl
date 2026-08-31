@@ -104,19 +104,19 @@ end
 
 A 4- and an 8-warp build for first-launch autotuning (mirrors
 `@triton.autotune`: measure once per specialization, remember the winner);
-tensor-core kernels without atomics additionally race load style × hints.
+tensor-core kernels additionally race load style × hints. The shim's racer
+snapshots and restores argument memory, so rerunning is safe for any
+kernel, atomics and read-modify-write included; when it cannot snapshot it
+falls back to the first candidate, so each list leads with the heuristic
+default (4 warps for memory-bound kernels, 8 for tensor-core ones —
+8 warps wins on starved grids and loop-heavy reductions, e.g. sm_120
+layernorm bwd_dwdb 101→59µs and bwd_dx 414→284µs).
 """
 function triton_kernel_candidates(@nospecialize(f), @nospecialize(argtypes);
                                   name::String, use_tma::Bool=true)
     use_tma &= _default_target().backend == "cuda"  # descriptors are NVIDIA-only
     ttir, argspec, meta = emit_ttir(f, argtypes; name, use_tma)
-    # atomic kernels are not rerun-safe, so they cannot race: pin 8 warps
-    # (winner on every measured case, e.g. sm_120 layernorm bwd_dx 414→284µs)
-    meta.has_atomic &&
-        return [compile_kernel(ttir, argspec; name, num_warps=8)]
     if !meta.has_dot
-        # memory-bound kernels: 8 warps wins on starved grids and loop-heavy
-        # reductions (sm_120 layernorm bwd_dwdb: 101→59µs), 4 warps elsewhere
         return [compile_kernel(ttir, argspec; name, num_warps=w) for w in (4, 8)]
     end
     # dot kernels: TMA-vs-pointer and argument hints both interact with the
@@ -126,7 +126,7 @@ function triton_kernel_candidates(@nospecialize(f), @nospecialize(argtypes);
                        emit_ttir(f, argtypes; name, use_tma=false, hints=true)[1],
                        emit_ttir(f, argtypes; name, use_tma=false, hints=false)[1]])
     return [compile_kernel(t, argspec; name, num_warps=w)
-            for t in variants for w in (4, 8)]
+            for t in variants for w in (8, 4)]
 end
 
 function triton_kernel(@nospecialize(f), @nospecialize(argtypes);

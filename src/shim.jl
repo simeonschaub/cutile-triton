@@ -81,6 +81,56 @@ end
 _device_sync() =
     (TritonRun._sync[] === nothing ? CUDA.synchronize : TritonRun._sync[])()
 
+# Racing candidates reruns the kernel, and a kernel may read-modify-write its
+# arguments (accumulation, spin locks, atomics). Snapshot every TileArray
+# argument's memory extent so each candidate — and the final real launch —
+# sees pristine inputs; the net effect is then exactly one application.
+const SNAPSHOT_LIMIT = 2 << 30  # fall back to no racing beyond 2 GiB
+
+function _arg_regions(args)
+    regions = Tuple{CuPtr{UInt8}, Int}[]
+    for a in args
+        _arg_regions!(regions, a)
+    end
+    return regions
+end
+
+function _arg_regions!(regions, @nospecialize(x))
+    T = typeof(x)
+    if x isa ct.TileArray
+        # strided extent in elements (holes included; restoring them is harmless)
+        nelem = 1
+        for (sz, st) in zip(x.sizes, x.strides)
+            sz == 0 && (nelem = 0; break)
+            nelem += (Int(sz) - 1) * abs(Int(st))
+        end
+        nelem > 0 &&
+            push!(regions, (CuPtr{UInt8}(UInt(x.ptr)), nelem * sizeof(eltype(x))))
+    elseif !Base.issingletontype(T) && !isprimitivetype(T)
+        for i in 1:fieldcount(T)
+            _arg_regions!(regions, getfield(x, i))
+        end
+    end
+    return regions
+end
+
+function _snapshot(regions)
+    snaps = Vector{CuArray{UInt8,1}}(undef, length(regions))
+    for (i, (ptr, n)) in enumerate(regions)
+        buf = CuArray{UInt8}(undef, n)
+        unsafe_copyto!(pointer(buf), ptr, n)
+        snaps[i] = buf
+    end
+    return snaps
+end
+
+function _restore!(regions, snaps)
+    for (i, (ptr, n)) in enumerate(regions)
+        unsafe_copyto!(ptr, pointer(snaps[i]), n)
+    end
+    return nothing
+end
+
 function (k::ShimKernel)(args...; blocks=1, threads=1, convert=Val(false), kwargs...)
     cuda = _iscuda()
     types = Any[]; vals = Any[]
@@ -95,19 +145,32 @@ function (k::ShimKernel)(args...; blocks=1, threads=1, convert=Val(false), kwarg
     g = blocks isa Integer ? (Int(blocks), 1, 1) :
         length(blocks) == 2 ? (blocks[1], blocks[2], 1) : Tuple(blocks)
     if k.chosen == 0
-        # first launch: race the candidates (dot kernels without atomics are
-        # rerun-safe), keep the winner for this specialization
-        best = 1; best_t = Inf
-        for (i, cand) in enumerate(k.candidates)
-            _launch_one(cand, types, vals, g)  # warmup/compile caches
+        # first launch: race the candidates and keep the winner for this
+        # specialization. Argument memory is snapshotted and restored around
+        # every launch so rerunning is safe even for kernels that
+        # read-modify-write their arguments (accumulation, locks, atomics).
+        regions = cuda ? _arg_regions(args) : Tuple{CuPtr{UInt8}, Int}[]
+        total = sum(last, regions; init=0)
+        if !cuda || total > SNAPSHOT_LIMIT
+            # cannot restore: don't rerun, fall back to the first candidate
+            # (candidate order puts the heuristic default first)
+            k.chosen = 1
+        else
+            snaps = _snapshot(regions)
+            best = 1; best_t = Inf
+            for (i, cand) in enumerate(k.candidates)
+                _launch_one(cand, types, vals, g)  # warmup/compile caches
+                _device_sync()
+                t0 = time_ns()
+                _launch_one(cand, types, vals, g)
+                _device_sync()
+                t = time_ns() - t0
+                t < best_t && (best_t = t; best = i)
+                _restore!(regions, snaps)
+            end
             _device_sync()
-            t0 = time_ns()
-            _launch_one(cand, types, vals, g)
-            _device_sync()
-            t = time_ns() - t0
-            t < best_t && (best_t = t; best = i)
+            k.chosen = best
         end
-        k.chosen = best
     end
     _launch_one(k.candidates[k.chosen], types, vals, g)
     return nothing
