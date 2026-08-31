@@ -114,6 +114,7 @@ const USE_TMA = Ref(true)
 # f32/tf32 on triton 3.7's Hopper pipeline, so gate on element size.
 tma_eligible(N, tile_shape, pad, contiguous, elty) =
     USE_TMA[] && 2 <= N <= 5 && contiguous &&
+    elty !== Bool &&    # Bool memory is i8-with-conversions, keep it off TMA
     sizeof(elty) <= 2 &&
     all(s -> 1 <= s <= 256, tile_shape) &&
     tile_shape[1] * sizeof(elty) >= 16
@@ -197,7 +198,7 @@ end
 
 function scalar_type(@nospecialize(T::DataType))
     if T <: Ptr
-        return IR.OpaqueType("tt", "ptr<" * string(scalar_type(eltype(T))) * ">")
+        return IR.OpaqueType("tt", "ptr<" * string(storage_type(eltype(T))) * ">")
     end
     T === Float64 && return IR.Type(Float64)
     T === Float32 && return IR.Type(Float32)
@@ -210,6 +211,35 @@ function scalar_type(@nospecialize(T::DataType))
     (T === Int8 || T === UInt8) && return IR.Type(Int8)
     T === Bool && return IR.Type(Bool)
     error("scalar_type: unsupported $T")
+end
+
+# Bool tiles are i1 in registers but one byte in memory (matching Julia's
+# Bool layout); triton cannot lower ptr<i1> loads/stores at all (LLVM
+# castIsValid abort in translateModuleToLLVMIR, triton 3.7.1), so pointers
+# always use the storage type and loads/stores convert (as Python triton does).
+storage_type(@nospecialize(T::DataType)) = T === Bool ? IR.Type(Int8) : scalar_type(T)
+
+# widen an i1 register tensor/scalar to its i8 storage form
+function to_storage(v::IR.Value)
+    t = IR.type(v)
+    if API.mlirTypeIsARankedTensor(t)
+        tensor_elem(t) == IR.Type(Bool) || return v
+        return v1(arith.extui(v; out=IR.TensorType(tensor_shape(v), IR.Type(Int8))))
+    end
+    t == IR.Type(Bool) || return v
+    return v1(arith.extui(v; out=IR.Type(Int8)))
+end
+
+# narrow an i8 storage tensor/scalar back to i1 (compare ≠ 0)
+function to_register_i1(v::IR.Value)
+    t = IR.type(v)
+    if API.mlirTypeIsARankedTensor(t)
+        z = materialize(0, t)
+        return v1(arith.cmpi(v, z; predicate=IR.Attribute(Int64(1)),  # ne
+                             result=IR.TensorType(tensor_shape(v), IR.Type(Bool))))
+    end
+    z = materialize(0, t)
+    return v1(arith.cmpi(v, z; predicate=IR.Attribute(Int64(1)), result=IR.Type(Bool)))
 end
 
 tile_eltype(::Type{ct.Tile{T,S}}) where {T,S} = T
@@ -385,7 +415,7 @@ function view_ptrs_mask(view::ViewInfo, idxs::Vector{Any}, cg::CG)
     sh = view.tile_shape
     N = length(sh)
     i32 = IR.Type(Int32)
-    et = scalar_type(view.elty)
+    et = storage_type(view.elty)
     ptr_t = IR.OpaqueType("tt", "ptr<" * string(et) * ">")
 
     flat_offs = nothing
@@ -486,16 +516,17 @@ function emit_view_load(view::ViewInfo, idxs::Vector{Any}, cg::CG)
         return loaded
     end
     ptrs, mask = view_ptrs_mask(view, idxs, cg)
-    res_t = tensor_of(view.tile_shape, scalar_type(view.elty))
-    if view.padding === :zero
-        other = splat_const(view.tile_shape, zero(view.elty <: Integer ? Int : Float64), scalar_type(view.elty))
-        return v1(tt.load(ptrs, mask; other=other, result=res_t))
+    res_t = tensor_of(view.tile_shape, storage_type(view.elty))
+    loaded = if view.padding === :zero
+        other = splat_const(view.tile_shape, zero(view.elty <: Integer || view.elty === Bool ? Int : Float64), storage_type(view.elty))
+        v1(tt.load(ptrs, mask; other=other, result=res_t))
     elseif view.padding === :neginf
-        other = splat_const(view.tile_shape, -Inf, scalar_type(view.elty))
-        return v1(tt.load(ptrs, mask; other=other, result=res_t))
+        other = splat_const(view.tile_shape, -Inf, storage_type(view.elty))
+        v1(tt.load(ptrs, mask; other=other, result=res_t))
     else
-        return v1(tt.load(ptrs, mask; result=res_t))
+        v1(tt.load(ptrs, mask; result=res_t))
     end
+    return view.elty === Bool ? to_register_i1(loaded) : loaded
 end
 
 function emit_view_store(view::ViewInfo, val::IR.Value, idxs::Vector{Any}, cg::CG)
@@ -504,7 +535,7 @@ function emit_view_store(view::ViewInfo, val::IR.Value, idxs::Vector{Any}, cg::C
         return nothing
     end
     ptrs, mask = view_ptrs_mask(view, idxs, cg)
-    tt.store(ptrs, val, mask)
+    tt.store(ptrs, view.elty === Bool ? to_storage(val) : val, mask)
     return nothing
 end
 
@@ -729,7 +760,7 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         sizes = resolve(cg, args[3])
         strides = resolve(cg, args[4])
         elty = eltype(TA)
-        spec = TA.parameters[3]
+        spec = TA.parameters[end]   # last param is the ArraySpec (cuTile 1.0 has I before it)
         contig = (spec isa DataType ? spec : typeof(spec)).parameters[3]::Bool
         return ViewInfo(asvalue(ptr), Any[sizes...], Any[strides...], elty,
                         nothing, :undetermined, contig, nothing, nothing)
@@ -768,6 +799,18 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         mask = length(args) >= 3 ? resolve(cg, args[3]) : nothing
         pad = length(args) >= 4 ? resolve(cg, args[4]) : nothing
         res_t = tile_type(typ)
+        # Bool gathers load their i8 storage form and narrow at the end
+        bool_mem = if API.mlirTypeIsARankedTensor(res_t)
+            tensor_elem(res_t) == IR.Type(Bool)
+        else
+            res_t == IR.Type(Bool)
+        end
+        if bool_mem
+            res_t = API.mlirTypeIsARankedTensor(res_t) ?
+                IR.TensorType(Int[API.mlirShapedTypeGetDimSize(res_t, i - 1)
+                                  for i in 1:API.mlirShapedTypeGetRank(res_t)], IR.Type(Int8)) :
+                IR.Type(Int8)
+        end
         mv = mask isa IR.Value ? mask : nothing
         # padding: an enum mode (Zero), a literal value, or a runtime scalar
         padval = pad isa IR.Value ? pad : pad isa Number ? pad :
@@ -779,17 +822,42 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
             else
                 materialize(padval, res_t)
             end
-            return v1(tt.load(ptrs, mv; other=other, result=res_t))
+            loaded = v1(tt.load(ptrs, mv; other=other, result=res_t))
+            return bool_mem ? to_register_i1(loaded) : loaded
         end
-        return mv === nothing ? v1(tt.load(ptrs; result=res_t)) :
-                                v1(tt.load(ptrs, mv; result=res_t))
+        loaded = mv === nothing ? v1(tt.load(ptrs; result=res_t)) :
+                                  v1(tt.load(ptrs, mv; result=res_t))
+        return bool_mem ? to_register_i1(loaded) : loaded
     elseif f === :store_ptr_tko
         # scatter: (ptrs, values, latency, mask[, token])
         ptrs = asvalue(resolve(cg, args[1]))
-        val = asvalue(resolve(cg, args[2]))
+        val = to_storage(asvalue(resolve(cg, args[2])))   # no-op unless i1
         mask = length(args) >= 4 ? resolve(cg, args[4]) : nothing
         mv = mask isa IR.Value ? mask : nothing
         mv === nothing ? tt.store(ptrs, val) : tt.store(ptrs, val, mv)
+        return nothing
+
+    # ---- printing ----
+    elseif f === :print_tko
+        # (segments-and-values..., token): string segments become tt.print
+        # prefixes; each value gets its own tt.print carrying the preceding text
+        items = Any[resolve(cg, a) for a in args[1:end-1]]   # drop the token
+        prefix = ""
+        for it in items
+            if it isa AbstractString
+                prefix *= it
+            elseif it isa IR.Value || it isa TF32Val
+                vv = asvalue(it)
+                t = IR.type(vv)
+                et = API.mlirTypeIsARankedTensor(t) ? tensor_elem(t) : t
+                signed = API.mlirTypeIsAInteger(et) ? Int32(1) : Int32(0)
+                tt.print(IR.Value[vv]; prefix=prefix, hex=false, isSigned=Int32[signed])
+                prefix = ""
+            else
+                prefix *= string(it)   # compile-time constant
+            end
+        end
+        isempty(prefix) || tt.print(IR.Value[]; prefix=prefix, hex=false, isSigned=Int32[])
         return nothing
 
     # ---- constants / construction ----
@@ -803,6 +871,14 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
             # runtime scalar: splat instead of a constant attribute
             vv = asvalue(val)
             isempty(sh) && return vv
+            if is_tensor(vv)
+                # a size-1 tile (e.g. fill(load(src, 1, (1,)), shape)):
+                # tt.splat needs a scalar, so reshape to all-1 dims of the
+                # target rank and tt.broadcast instead
+                n = length(sh)
+                vv = v1(tt.reshape(vv; result=IR.TensorType(fill(1, n), et)))
+                return v1(tt.broadcast(vv; result=tensor_of(sh, et)))
+            end
             return v1(tt.splat(vv; result=tensor_of(sh, et)))
         end
         isempty(sh) && return const_scalar(val, et)
@@ -893,6 +969,14 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         a = resolve(cg, args[1]); b = resolve(cg, args[2])
         av, bv = _pair_values(a, b)
         return v1(INT_BIN[f](av, bv; result=IR.type(av)))
+    elseif f === :maxf || f === :minf
+        # optional 3rd arg propagate_nan (default false, i.e. NaN-ignoring)
+        a = resolve(cg, args[1]); b = resolve(cg, args[2])
+        av, bv = _pair_values(a, b)
+        prop = length(args) >= 3 && resolve(cg, args[3]) == true
+        op2 = f === :maxf ? (prop ? arith.maximumf : arith.maxnumf) :
+                            (prop ? arith.minimumf : arith.minnumf)
+        return v1(op2(av, bv; result=IR.type(av)))
     elseif haskey(FLT_BIN, f)
         a = resolve(cg, args[1]); b = resolve(cg, args[2])
         av, bv = _pair_values(a, b)
@@ -927,6 +1011,14 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         # pairwise join → move pair axis before the target axis → merge.
         # (order-preserving, unlike tt.cat, and layout-agnostic — tt.cat's
         # register-layout constraint rejects small i8 concats.)
+        # i1 join/trans chains abort triton's LLVM translation (castIsValid
+        # assert): do the shuffle in i8 and compare back to i1 at the end.
+        was_i1 = et == IR.Type(Bool)
+        if was_i1
+            et = IR.Type(Int8)
+            vals = IR.Value[v1(arith.extui(v; out=IR.TensorType(tensor_shape(v), et)))
+                            for v in vals]
+        end
         d <= 0 && (d = N + d)              # negative axis = from the end
         ax = axis_of(N, d)
         while length(vals) > 1
@@ -943,6 +1035,13 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
                 push!(nxt, v1(tt.reshape(t; result=IR.TensorType(msh, et))))
             end
             vals = nxt
+        end
+        if was_i1
+            r = vals[1]
+            sh = tensor_shape(r)
+            z = materialize(0, IR.type(r))
+            return v1(arith.cmpi(r, z; predicate=IR.Attribute(Int64(1)),  # ne
+                                 result=IR.TensorType(sh, IR.Type(Bool))))
         end
         return vals[1]
     elseif f === :remi
@@ -963,12 +1062,34 @@ function walk_call!(cg::CG, @nospecialize(callee), args::Vector{Any}, @nospecial
         op = signed ? arith.shrsi : arith.shrui
         return v1(op(av, bv; result=IR.type(av)))
     elseif f === :pow
-        # triton's pipeline has no math.powf legalization; use exp2(y·log2 x)
+        # triton's pipeline has no math.powf legalization; use exp2(y·log2 |x|)
+        # plus IEEE-pow fixups: negative base with integral y takes the parity
+        # sign (NaN when y is non-integral), and y == 0 is 1 for every x.
         a = resolve(cg, args[1]); b = resolve(cg, args[2])
         av, bv = _pair_values(a, b)
-        lg = v1(math.log2(av; result=IR.type(av)))
-        pr = v1(arith.mulf(bv, lg; result=IR.type(av)))
-        return v1(math.exp2(pr; result=IR.type(av)))
+        T = IR.type(av)
+        bool_t = API.mlirTypeIsARankedTensor(T) ?
+            IR.TensorType(tensor_shape(av), IR.Type(Bool)) : IR.Type(Bool)
+        cmpfv(x, y, pred) = v1(arith.cmpf(x, y; predicate=IR.Attribute(Int64(pred)), result=bool_t))
+        ax = v1(math.absf(av; result=T))
+        lg = v1(math.log2(ax; result=T))
+        pr = v1(arith.mulf(bv, lg; result=T))
+        r = v1(math.exp2(pr; result=T))
+        zero = materialize(0, T); one = materialize(1, T); two = materialize(2, T)
+        isneg = cmpfv(av, zero, 4)                       # olt
+        yfl = v1(math.floor(bv; result=T))
+        isint = cmpfv(yfl, bv, 1)                        # oeq
+        halfy = v1(arith.divf(bv, two; result=T))
+        hfl = v1(math.floor(halfy; result=T))
+        m = v1(arith.subf(bv, v1(arith.mulf(hfl, two; result=T)); result=T))
+        isodd = cmpfv(m, one, 1)                         # y - 2⌊y/2⌋ == 1
+        negr = v1(arith.subf(zero, r; result=T))
+        signed_r = v1(arith.select(isodd, negr, r; result=T))
+        nanv = materialize(NaN, T)
+        neg_case = v1(arith.select(isint, signed_r, nanv; result=T))
+        res = v1(arith.select(isneg, neg_case, r; result=T))
+        iszero_y = cmpfv(bv, zero, 1)
+        return v1(arith.select(iszero_y, one, res; result=T))
     elseif haskey(MATH_UN, f)
         a = asvalue(resolve(cg, args[1]))
         return v1(MATH_UN[f](a; result=IR.type(a)))
@@ -1560,7 +1681,8 @@ _divattr(v) = (EMIT_DIV_ATTRS[] && v >= 2) ?
     IR.Attribute(Dict{String,IR.Attribute}())
 
 function _spec_params(@nospecialize(T))
-    spec = T.parameters[3]
+    # TileArray{T,N,I,Spec}: the spec is the last parameter
+    spec = T.parameters[end]
     P = (spec isa DataType ? spec : typeof(spec)).parameters
     # (N, Alignment, Contiguous, StrideDivBy, ShapeDivBy)
     return Int(P[2]), P[3]::Bool, P[4], P[5]
@@ -1570,7 +1692,7 @@ function arg_mlir_types!(out::Vector{IR.Type}, attrs::Vector{IR.Attribute}, @nos
     i32 = IR.Type(Int32)
     empty_d = IR.Attribute(Dict{String,IR.Attribute}())
     if T <: ct.TileArray
-        push!(out, IR.OpaqueType("tt", "ptr<" * string(scalar_type(eltype(T))) * ">"))
+        push!(out, IR.OpaqueType("tt", "ptr<" * string(storage_type(eltype(T))) * ">"))
         align, contig, sdiv, shdiv = _spec_params(T)
         push!(attrs, _divattr(_div16(align)))
         for d in 1:ndims(T)   # sizes

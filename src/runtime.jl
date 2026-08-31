@@ -102,19 +102,23 @@ end
 """
     triton_kernel_candidates(f, argtypes; name, use_tma=true) -> Vector{TritonKernel}
 
-One kernel for memory-bound code (4 warps); for tensor-core kernels without
-atomics, both a 4- and an 8-warp build for first-launch autotuning (mirrors
-`@triton.autotune`: measure once per specialization, remember the winner).
+A 4- and an 8-warp build for first-launch autotuning (mirrors
+`@triton.autotune`: measure once per specialization, remember the winner);
+tensor-core kernels additionally race load style × hints. The shim's racer
+snapshots and restores argument memory, so rerunning is safe for any
+kernel, atomics and read-modify-write included; when it cannot snapshot it
+falls back to the first candidate, so each list leads with the heuristic
+default (4 warps for memory-bound kernels, 8 for tensor-core ones —
+8 warps wins on starved grids and loop-heavy reductions, e.g. sm_120
+layernorm bwd_dwdb 101→59µs and bwd_dx 414→284µs).
 """
 function triton_kernel_candidates(@nospecialize(f), @nospecialize(argtypes);
                                   name::String, use_tma::Bool=true)
     use_tma &= _default_target().backend == "cuda"  # descriptors are NVIDIA-only
     ttir, argspec, meta = emit_ttir(f, argtypes; name, use_tma)
     if !meta.has_dot
-        return [compile_kernel(ttir, argspec; name, num_warps=4)]
+        return [compile_kernel(ttir, argspec; name, num_warps=w) for w in (4, 8)]
     end
-    meta.has_atomic &&
-        return [compile_kernel(ttir, argspec; name, num_warps=8)]
     # dot kernels: TMA-vs-pointer and argument hints both interact with the
     # tensor-core pipeline in shape-dependent ways — race load style × hints
     # × warps (unique TTIRs only; e.g. TMA-ineligible kernels dedupe)
@@ -122,7 +126,7 @@ function triton_kernel_candidates(@nospecialize(f), @nospecialize(argtypes);
                        emit_ttir(f, argtypes; name, use_tma=false, hints=true)[1],
                        emit_ttir(f, argtypes; name, use_tma=false, hints=false)[1]])
     return [compile_kernel(t, argspec; name, num_warps=w)
-            for t in variants for w in (4, 8)]
+            for t in variants for w in (8, 4)]
 end
 
 function triton_kernel(@nospecialize(f), @nospecialize(argtypes);
@@ -139,17 +143,33 @@ end
 # triton's own backend defaults: 3 pipeline stages on NVIDIA, 2 on AMD (64KB LDS)
 _default_stages() = _default_target().backend == "cuda" ? 3 : 2
 
+# Per-block dynamic shared memory limit of the current device (opt-in), or
+# nothing when the backend has no queryable limit.
+_shared_limit() = _default_target().backend == "cuda" ?
+    CUDA.attribute(CUDA.device(),
+                   CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN) : nothing
+
 function compile_kernel(ttir::String, argspec; name::String, num_warps::Int,
                         num_stages::Union{Int,Nothing}=nothing)
+    explicit_stages = num_stages !== nothing
     num_stages = something(num_stages, _default_stages())
     if haskey(ENV, "TRITON_DUMP_TTIR")
         mkpath(ENV["TRITON_DUMP_TTIR"])
         write(joinpath(ENV["TRITON_DUMP_TTIR"], "$(name)_w$(num_warps)_$(hash(ttir) % 10000).ttir"), ttir)
     end
     k = _compile_py(ttir, name, num_warps, num_stages)
+    shared = pyconvert(Int, k.metadata.shared)
+    # triton sizes its software pipeline for the tile shape, not the device:
+    # a 3-stage matmul that fits an H100's 228KB can exceed a consumer GPU's
+    # ~99KB opt-in limit. Drop stages until the kernel fits.
+    limit = explicit_stages ? nothing : _shared_limit()
+    while limit !== nothing && shared > limit && num_stages > 1
+        num_stages -= 1
+        k = _compile_py(ttir, name, num_warps, num_stages)
+        shared = pyconvert(Int, k.metadata.shared)
+    end
     t = _default_target()
     bin = pyconvert(Vector{UInt8}, k.asm[t.binkey])
-    shared = pyconvert(Int, k.metadata.shared)
     warp_size = pyconvert(Int, k.metadata.warp_size)
     # NVIDIA-only metadata field; the AMD backend has no global scratch
     # (its launcher passes NULL in that ABI slot).
@@ -237,7 +257,7 @@ function code_triton(io::IO, @nospecialize(f), @nospecialize(argtypes);
         print(io, ttir)
         return nothing
     end
-    k = _compile_py(ttir, name, num_warps, num_stages)
+    k = _compile_py(ttir, name, num_warps, something(num_stages, _default_stages()))
     if stage === :sass
         cubin_path = joinpath(mktempdir(), "$name.cubin")
         write(cubin_path, pyconvert(Vector{UInt8}, k.asm["cubin"]))

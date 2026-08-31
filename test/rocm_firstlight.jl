@@ -18,7 +18,7 @@ function vadd(a, b, c, tile::Int)
     ct.store(c; index=bid, tile=ct.load(a; index=bid, shape=(tile,)) + ct.load(b; index=bid, shape=(tile,)))
     return
 end
-TA = ct.TileArray{Float32,1,S1}
+TA = ct.TileArray{Float32,1,Int32,S1}
 tt = Tuple{TA, TA, TA, ct.Constant{Int, 1024}}
 
 println("[3] emit")
