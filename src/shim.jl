@@ -125,6 +125,11 @@ Route ALL cuTile compilation through the Triton backend by overwriting
 """
 function install_shim!()
     @eval TritonShim.ct function cufunction(@nospecialize(f), tt::Type{<:Tuple}=Tuple{}; kwargs...)
+        # @device_code_* reflection rides compile_hook; keep it working (the
+        # hook runs the native pipeline, orthogonal to how we compile/launch)
+        if compile_hook[] !== nothing
+            Base.invokelatest(compile_hook[], f, tt)
+        end
         return $(TritonShim).get_kernel(f, tt)
     end
     return nothing
